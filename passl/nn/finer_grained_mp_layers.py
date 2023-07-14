@@ -49,6 +49,32 @@ def get_finer_grained_model_parallel_communication_info():
 
     return mp_rank, mp_ranks, mp_group, send_group, recv_group, send_dst, recv_src
 
+
+def finer_grained_rowsharded_linear_test(x, weight, bias=None, transpose_y=False, name=None):
+    """
+    y = x * weight + b = matmul(x, weight) + b
+    """
+    mp_ranks = 8
+    # reverse order [mp_ranks-1, ..., 1, 0]
+    cal_index = range(mp_ranks-1, -1, -1)
+
+    wi = weight
+    y = []
+    w_all_next = []
+    task = paddle.distributed.all_gather(w_all_next,wi,sync_op=False)
+    x = paddle.split(x,mp_ranks,axis=-1)
+    for idx, t in enumerate(cal_index):
+        # slice and calculate matmul
+        xi = x[t]
+        yi = paddle.matmul(xi, wi, transpose_y=transpose_y)
+        # sum
+        y.append(yi)
+    y = paddle.add_n(y)
+    if bias is not None:
+        y = y + bias
+    task.wait()
+    return  y
+
 def finer_grained_rowsharded_linear(x, weight, bias=None, transpose_y=False, name=None):
     """
     y = x * weight + b = matmul(x, weight) + b
