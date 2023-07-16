@@ -58,8 +58,9 @@ def finer_grained_rowsharded_linear_test(x, weight, bias=None, transpose_y=False
     mp_rank = hcg.get_model_parallel_rank()
     mp_ranks = hcg.get_model_parallel_world_size()
     # reverse order [mp_ranks-1, ..., 1, 0]
-    cal_index = list(range(0,mp_ranks))
-    shift = mp_rank
+    cal_index = list(range(mp_ranks-1, -1, -1))
+    # shift
+    shift = mp_ranks - mp_rank - 1
     cal_index = cal_index[shift:] + cal_index[:shift]
 
     hidden_size = x.shape[-1]
@@ -69,11 +70,13 @@ def finer_grained_rowsharded_linear_test(x, weight, bias=None, transpose_y=False
     y = []
     x = paddle.split(x,mp_ranks,axis=-1)
     w_send = weight
-    w_recv = [paddle.zeros_like(wi,dtype=paddle.float16)] * mp_ranks
+    w_recv = [] 
+    for _ in range(mp_ranks-1):
+        w_recv.append(paddle.empty_like(wi))
     list_send_recv = []
     for rank in range(1,mp_ranks):
         list_send_recv.append(dist.P2POp(dist.isend,w_send,(mp_rank + rank)%mp_ranks))
-        list_send_recv.append(dist.P2POp(dist.irecv,w_recv[rank-1],(mp_rank-rank)%mp_ranks))
+        list_send_recv.append(dist.P2POp(dist.irecv,w_recv[rank-1],(mp_rank-rank+mp_ranks)%mp_ranks))
 
     tasks = dist.batch_isend_irecv(list_send_recv)
     for idx, t in enumerate(cal_index):
@@ -92,6 +95,52 @@ def finer_grained_rowsharded_linear_test(x, weight, bias=None, transpose_y=False
         y = y + bias
     return  y
 
+
+def finer_grained_columnsharded_linear_test(x, weight, bias=None, transpose_y=False, name=None):
+    """
+    y = x * weight + b = matmul(x, weight) + b
+    """
+    hcg = fleet.get_hybrid_communicate_group()
+    mp_rank = hcg.get_model_parallel_rank()
+    mp_ranks = hcg.get_model_parallel_world_size()
+    # reverse order [mp_ranks-1, ..., 1, 0]
+    cal_index = list(range(0,mp_ranks))
+    shift = mp_rank
+    cal_index = cal_index[shift:] + cal_index[:shift]
+
+    wi = weight
+    y = []
+    w_send = weight
+    w_recv = [] 
+    for i in range(mp_ranks-1):
+        w_recv.append(paddle.empty_like(wi))
+    list_send_recv = []
+    for rank in range(1,mp_ranks):
+        list_send_recv.append(dist.P2POp(dist.isend,w_send,(mp_rank + rank)%mp_ranks))
+        list_send_recv.append(dist.P2POp(dist.irecv,w_recv[rank-1],(mp_rank-rank)%mp_ranks))
+    tasks = dist.batch_isend_irecv(list_send_recv)
+    for idx in range(mp_ranks):
+        # slice and calculate matmul
+        yi = paddle.matmul(x, wi, transpose_y=transpose_y)
+
+        y.append(yi)
+
+        # we need to sync and get received wi
+        if idx < mp_ranks-1:
+            for id in range(2):
+                tasks[idx*2 + id].wait()
+            wi = w_recv[idx]
+
+    # shift results
+    shift = mp_rank + 1
+    y = y[shift:] + y[:shift]
+    y = y[::-1]
+    y = paddle.concat(y, axis=-1)
+
+    if bias is not None:
+        y = y + bias
+
+    return y
 
 def finer_grained_rowsharded_linear(x, weight, bias=None, transpose_y=False, name=None):
     """
