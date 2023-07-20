@@ -49,6 +49,113 @@ def get_finer_grained_model_parallel_communication_info():
 
     return mp_rank, mp_ranks, mp_group, send_group, recv_group, send_dst, recv_src
 
+def finer_grained_rowsharded_linear_wx(x, weight, bias=None, transpose_y=False, name=None):
+    """
+    y = x * weight + b = matmul(x, weight) + b
+    """
+
+    mp_rank, mp_ranks, mp_group, send_group, recv_group, send_dst, recv_src = \
+        get_finer_grained_model_parallel_communication_info()
+
+    hidden_size = x.shape[-1]
+    assert hidden_size % mp_ranks == 0, f"hidden_size {hidden_size} must be divided by mp_ranks {mp_ranks}"
+    micro_hidden_size = hidden_size // mp_ranks
+
+    # reverse order [mp_ranks-1, ..., 1, 0]
+    cal_index = list(range(mp_ranks-1, -1, -1))
+    # shift
+    shift = mp_ranks - mp_rank - 1
+    cal_index = cal_index[shift:] + cal_index[:shift]
+
+    wi = weight
+
+    y = None
+    x_recv = paddle.empty_like(x)
+    for idx, t in enumerate(cal_index):
+        start = t * micro_hidden_size
+        end = start + micro_hidden_size
+
+        # launch async send and recv
+        if idx < mp_ranks-1:
+            if mp_rank % 2 == 0:
+                task_send = dist.isend(x, dst=send_dst, group=send_group)
+            else:
+                task_recv = dist.irecv(x_recv, src=recv_src, group=recv_group)
+
+            if mp_rank % 2 == 0:
+                task_recv = dist.irecv(x_recv, src=recv_src, group=recv_group)
+            else:
+                task_send = dist.isend(x, dst=send_dst, group=send_group)
+
+        # slice and calculate matmul
+        xi = paddle.slice(x, axes=[-1], starts=[start], ends=[end])
+        yi = paddle.matmul(xi, wi, transpose_y=transpose_y)
+
+        # sum
+        if idx == 0:
+            y = yi
+        else:
+            y = y + yi
+
+        # we need to sync and get received xi
+        if idx < mp_ranks-1:
+            task_send.wait()
+            task_recv.wait()
+            # xi = x_recv
+
+    if bias is not None:
+        y = y + bias
+
+    return y
+
+
+def finer_grained_columnsharded_linear_wx(x, weight, bias=None, transpose_y=False, name=None):
+    """
+    y = x * weight + b = matmul(x, weight) + b
+    """
+
+    mp_rank, mp_ranks, mp_group, send_group, recv_group, send_dst, recv_src = \
+        get_finer_grained_model_parallel_communication_info()
+
+    wi = weight
+    xi = x
+    y = []
+    x_recv = paddle.empty_like(x)
+    for idx in range(mp_ranks):
+        # launch async send and recv
+        if idx < mp_ranks-1:
+            if mp_rank % 2 == 0:
+                task_send = dist.isend(xi, dst=send_dst, group=send_group)
+            else:
+                task_recv = dist.irecv(x_recv, src=recv_src, group=recv_group)
+
+            if mp_rank % 2 == 0:
+                task_recv = dist.irecv(x_recv, src=recv_src, group=recv_group)
+            else:
+                task_send = dist.isend(xi, dst=send_dst, group=send_group)
+
+        # slice and calculate matmul
+        yi = paddle.matmul(x, wi, transpose_y=transpose_y)
+
+        y.append(yi)
+
+        # we need to sync and get received wi
+        if idx < mp_ranks-1:
+            task_send.wait()
+            task_recv.wait()
+            #wi = w_recv
+
+    # shift results
+    shift = mp_rank + 1
+    y = y[shift:] + y[:shift]
+    y = y[::-1]
+    y = paddle.concat(y, axis=-1)
+
+    if bias is not None:
+        y = y + bias
+
+    return y
+
 
 def finer_grained_rowsharded_linear(x, weight, bias=None, transpose_y=False, name=None):
     """
@@ -96,7 +203,7 @@ def finer_grained_rowsharded_linear(x, weight, bias=None, transpose_y=False, nam
             y = yi
         else:
             y = y + yi
-            
+
         # we need to sync and get received xi
         if idx < mp_ranks-1:
             task_send.wait()
@@ -108,8 +215,7 @@ def finer_grained_rowsharded_linear(x, weight, bias=None, transpose_y=False, nam
 
     return y
 
-
-def finer_grained_rowsharded_linear_wx(x, weight, bias=None, transpose_y=False, name=None):
+def finer_grained_columnsharded_linear(x, weight, bias=None, transpose_y=False, name=None):
     """
     y = x * weight + b = matmul(x, weight) + b
     """
@@ -117,56 +223,46 @@ def finer_grained_rowsharded_linear_wx(x, weight, bias=None, transpose_y=False, 
     mp_rank, mp_ranks, mp_group, send_group, recv_group, send_dst, recv_src = \
         get_finer_grained_model_parallel_communication_info()
 
-    hidden_size = x.shape[-1]
-    assert hidden_size % mp_ranks == 0, f"hidden_size {hidden_size} must be divided by mp_ranks {mp_ranks}"
-    micro_hidden_size = hidden_size // mp_ranks
-
-    # reverse order [mp_ranks-1, ..., 1, 0]
-    cal_index = list(range(mp_ranks-1, -1, -1))
-    # shift
-    shift = mp_ranks - mp_rank - 1
-    cal_index = cal_index[shift:] + cal_index[:shift]
-
     wi = weight
-    y = None
-    w_recv = paddle.empty_like(wi)
-    for idx, t in enumerate(cal_index):
-        start = t * micro_hidden_size
-        end = start + micro_hidden_size
+    y = []
 
+    for idx in range(mp_ranks):
         # launch async send and recv
         if idx < mp_ranks-1:
             if mp_rank % 2 == 0:
                 task_send = dist.isend(wi, dst=send_dst, group=send_group)
             else:
-
+                w_recv = paddle.zeros_like(wi)
                 task_recv = dist.irecv(w_recv, src=recv_src, group=recv_group)
 
             if mp_rank % 2 == 0:
+                w_recv = paddle.zeros_like(wi)
                 task_recv = dist.irecv(w_recv, src=recv_src, group=recv_group)
             else:
                 task_send = dist.isend(wi, dst=send_dst, group=send_group)
 
         # slice and calculate matmul
-        xi = paddle.slice(x, axes=[-1], starts=[start], ends=[end])
-        yi = paddle.matmul(xi, wi, transpose_y=transpose_y)
+        yi = paddle.matmul(x, wi, transpose_y=transpose_y)
 
-        # sum
-        if idx == 0:
-            y = yi
-        else:
-            y = y + yi
+        y.append(yi)
 
-        # we need to sync and get received xi
+        # we need to sync and get received wi
         if idx < mp_ranks-1:
             task_send.wait()
             task_recv.wait()
             wi = w_recv
 
+    # shift results
+    shift = mp_rank + 1
+    y = y[shift:] + y[:shift]
+    y = y[::-1]
+    y = paddle.concat(y, axis=-1)
+
     if bias is not None:
         y = y + bias
 
     return y
+
 
 def finer_grained_rowsharded_linear_grad(dy, x, weight, bias=None, name=None):
     mp_rank, mp_ranks, mp_group, send_group, recv_group, send_dst, recv_src = \
@@ -250,98 +346,6 @@ def finer_grained_rowsharded_linear_grad(dy, x, weight, bias=None, name=None):
     return x_grad, weight_grad, bias_grad
 
 
-def finer_grained_columnsharded_linear(x, weight, bias=None, transpose_y=False, name=None):
-    """
-    y = x * weight + b = matmul(x, weight) + b
-    """
-
-    mp_rank, mp_ranks, mp_group, send_group, recv_group, send_dst, recv_src = \
-        get_finer_grained_model_parallel_communication_info()
-
-    wi = weight
-    y = []
-    w_recv = paddle.empty_like(wi)
-    for idx in range(mp_ranks):
-        # launch async send and recv
-        if idx < mp_ranks-1:
-            if mp_rank % 2 == 0:
-                task_send = dist.isend(wi, dst=send_dst, group=send_group)
-            else:
-                task_recv = dist.irecv(w_recv, src=recv_src, group=recv_group)
-
-            if mp_rank % 2 == 0:
-                task_recv = dist.irecv(w_recv, src=recv_src, group=recv_group)
-            else:
-                task_send = dist.isend(wi, dst=send_dst, group=send_group)
-
-        # slice and calculate matmul
-        yi = paddle.matmul(x, wi, transpose_y=transpose_y)
-
-        y.append(yi)
-
-        # we need to sync and get received wi
-        if idx < mp_ranks-1:
-            task_send.wait()
-            task_recv.wait()
-            wi = w_recv
-
-    # shift results
-    shift = mp_rank + 1
-    y = y[shift:] + y[:shift]
-    y = y[::-1]
-    y = paddle.concat(y, axis=-1)
-
-    if bias is not None:
-        y = y + bias
-
-    return y
-
-def finer_grained_columnsharded_linear_wx(x, weight, bias=None, transpose_y=False, name=None):
-    """
-    y = x * weight + b = matmul(x, weight) + b
-    """
-
-    mp_rank, mp_ranks, mp_group, send_group, recv_group, send_dst, recv_src = \
-        get_finer_grained_model_parallel_communication_info()
-
-    wi = weight
-    y = []
-    w_recv = paddle.empty_like(wi)
-    for idx in range(mp_ranks):
-        # launch async send and recv
-        if idx < mp_ranks-1:
-            if mp_rank % 2 == 0:
-                task_send = dist.isend(wi, dst=send_dst, group=send_group)
-            else:
-
-                task_recv = dist.irecv(w_recv, src=recv_src, group=recv_group)
-
-            if mp_rank % 2 == 0:
-                task_recv = dist.irecv(w_recv, src=recv_src, group=recv_group)
-            else:
-                task_send = dist.isend(wi, dst=send_dst, group=send_group)
-
-        # slice and calculate matmul
-        yi = paddle.matmul(x, wi, transpose_y=transpose_y)
-
-        y.append(yi)
-
-        # we need to sync and get received wi
-        if idx < mp_ranks-1:
-            task_send.wait()
-            task_recv.wait()
-            wi = w_recv
-
-    # shift results
-    shift = mp_rank + 1
-    y = y[shift:] + y[:shift]
-    y = y[::-1]
-    y = paddle.concat(y, axis=-1)
-
-    if bias is not None:
-        y = y + bias
-
-    return y
 
 def finer_grained_columnsharded_linear_grad(dy, x, weight, bias=None, name=None):
     mp_rank, mp_ranks, mp_group, send_group, recv_group, send_dst, recv_src = \
